@@ -1,0 +1,38 @@
+stages:
+  - upload
+  - release
+
+variables:
+  PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${CI_PROJECT_NAME}"
+  S3_BUCKET: jmeb-prj
+  S3_RELEASE_DIR: s3://${S3_BUCKET}/releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}
+  S3_PUBLIC_URL: https://${S3_BUCKET}.s3.eu-west-3.amazonaws.com/releases/${CI_PROJECT_NAME}/${CI_COMMIT_TAG}
+
+upload-package-repo:
+  stage: upload
+  image: curlimages/curl:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file swarm-dind ${PACKAGE_REGISTRY_URL}/${CI_COMMIT_TAG:1}/swarm-dind
+
+upload-s3:
+  stage: upload
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - aws s3 cp swarm-dind ${S3_RELEASE_DIR}/swarm-dind
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      release-cli create \
+        --name "$CI_COMMIT_TAG" \
+        --tag-name $CI_COMMIT_TAG \
+        --assets-link="{\"name\":\"swarm-dind\",\"filepath\":\"/swarm-dind\",\"url\":\"${S3_PUBLIC_URL}/swarm-dind\"}"

@@ -1,0 +1,1429 @@
+#!/bin/bash
+# swarm-dind 1.0.0   Manage swarm clusters with DinD
+# Copyright (C)) 2020 Jean-Marc El Baki
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+# Uncomment following lines to help debugging
+# set -x
+# exec 5> debug.txt
+# BASH_XTRACEFD="5"
+# PS4='$LINENO: '
+
+
+######################################################################################
+#
+# Documentation and info
+#
+######################################################################################
+
+version () {
+  cat <<EOF | sed -E "s/^  //"
+  swarm-dind 1.0.0
+  Copyright (C) 2020 Jean-Marc El Baki
+  License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+  This is free software: you are free to change and redistribute it.
+  There is NO WARRANTY, to the extent permitted by law.
+EOF
+}
+
+#=====================================================================================
+###> Documentation
+#=====================================================================================
+usage () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} [options] <command>
+  
+  A script to manage multiple Swarm clusters using dind as nodes
+  
+  Official image docker:stable-dind is used by default (or var DIND_IMAGE if defined). You can mix
+  version in a cluster (as long as they are compatible at API level).
+  You can also use custom images, but they MUST respect following rules:
+    * automatically run dockerd when starting
+    * provide a valid health-check (the default verify dockerd locally accessible via socket)
+    * listen on port 2375 if not using TLS (to create context correctly)
+    * listen on port 2376, give container an env var DOCKER_TLS_CERTDIR with
+      certificates in $DOCKER_TLS_CERTDIR/client (to create context and install certificates correctly)
+  
+  Avoid to add nodes manually, or at least create them with label swarm-dind.cluster=<cluster_name_to_join>
+  and if necessary override health-check or other options
+  
+  The cluster to be managed is determined by the following rules, with precedence from greatest to least
+  1. Command-line
+     use the '-c' / '--cluster' option
+  2. Session-wide
+     use the CLUSTER_NAME environment variable
+  3. System-wide (for a user)
+     defined by command 'default <cluster_name>'
+  4. Default value '${SD_DEFAULT_CLUSTER_NAME}'
+  
+  Options:
+    -c, --cluster string   Cluster name to operate
+    -h, --help             This help text
+    -v, --version          Print version information and quit
+  
+  Commands:
+    init      Create a new Swarm cluster
+    apply     Change numbers of managers and workers in cluster
+    nodes     List nodes
+    info      Show environments variables and command usable to reach the cluster
+    repair    Try to relaunch inactive nodes, re-create missing contexts or certificates, remove unused datas
+    destroy   Remove all datas concerning a cluster (nodes, contexts, certificates)
+    list      List all clusters
+    default   Define the cluster to manage by default
+  
+  Run '${0##*/} <command> --help' for more information on a command.
+EOF
+}
+
+usage_init () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} nodes [options] [<cluster_name>]
+  
+  Create a new cluster with a manager
+  
+  Options:
+    -i, --image         Docker image runned to bootstrap the cluster (use var DIND_IMAGE or
+                        docker:stable-dind by default)
+        --mount-certs   Mount /etc/docker/certs.d in dind container
+        --node          Assign a name (randomized one by default)
+        --unprivileged  Don't used privileged mode, generally required but may be useless
+                        depending on your runtime or other config
+  
+  Arguments:
+    cluster_name   Name for the cluster (optional, if not defined use in
+                   order --cluster, var CLUSTER_NAME or '${SD_DEFAULT_CLUSTER_NAME}')
+  
+  Environment variables:
+    EXTRA_RUN_OPTIONS       Any options to add to docker run command creating the
+                            dind-container (already created containers won't be affected)
+    EXTRA_COMMAND_PARAMS    This will be passed as command to 'docker run'
+    EXTRA_NETWORK_OPTIONS   These options will be added to the 'docker network create' command
+EOF
+}
+
+usage_apply () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} apply [options] <managers_op> <workers_op>
+  
+  Modify number of workers and managers nodes in cluster. (NB: only nodes with appropriate labels
+  are taken into account)
+  
+  Options:
+    -i, --image         Docker image to use for any new container (use var DIND_IMAGE or
+                        docker:stable-dind by default)
+        --mount-certs   Mount /etc/docker/certs.d in dind container
+        --new-nodes     List of names (separated by comma) to use for nodes
+                        Empty element in list and new nodes exceeding list are randomized
+        --unprivileged  Don't use privileged mode, generally required but may be useless
+                        depending on your runtime or other config
+    -d, --dry-run       Display changes to be made (allows to see which nodes will be
+                        removed, promoted or demoted), don't apply them
+  
+  Arguments:
+    managers_op   Change to make on managers nodes:
+                    n      desired number of nodes
+                    +n/-n  add / remove n nodes
+                    !      keep all nodes
+    workers_op    Nombre de managers valeurs possibles:
+                    n      desired number of nodes
+                    +n/-n  add / remove n nodes
+                    !      keep all nodes
+  
+  Environment variables:
+    EXTRA_RUN_OPTIONS      Any options to add to 'docker run' command creating the dind-container
+    EXTRA_COMMAND_PARAMS   This will be passed as command to 'docker run'
+  
+  Examples of use:
+    Define exactly how many managers and workers are desired:
+      $ swarm-dind apply 3 10
+    
+    Add 1 managers and 2 workers:
+      $ swarm-dind apply +1 +2
+    
+    Add 3 managers:
+      $ swarm-dind apply +3 !
+    
+    Remove 2 workers:
+      $ swarm-dind apply ! -2
+    
+    Demote 1 manager:
+      $ swarm-dind apply -1 +1
+    
+    Promote 1 worker and remove 2 workers:
+      $ swarm-dind apply +1 -3
+EOF
+}
+
+usage_nodes () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} nodes [options]
+  
+  List nodes in a cluster
+  
+  Options:
+    -m, --managers   Filter only workers
+    -w, --workers    Filter only managers
+        --no-ip      Don't fetch node IP address (may be faster if many nodes)
+        --no-trunc   Don't truncate node ID
+EOF
+}
+
+usage_info () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} info
+  
+  List information on a cluster to interact with the cluster (currently available
+  manager, useful environment variables, registration token, etc.)
+EOF
+}
+
+usage_repair () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} repair [options]
+  
+  Search for
+    * nodes which are not 'Ready' and make them join the cluster or remove them
+    * dind which are not in the cluster anymore and remove them
+    * missing certificates and recopy them locally
+    * undefined context and recreate them
+  
+  If a cluster was not managed from your host or by another user, this command
+  can be used to fetch certificates and create context for each dind-nodes
+  
+  Options:
+    -d, --dry-run   Trial run, no changes made
+EOF
+}
+
+usage_destroy () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} destroy [<cluster_name>]
+  
+  Remove a cluster and all its datas (certificates, etc.)
+  
+  Options:
+    -d, --dry-run   Don't run deletion
+  
+  Arguments:
+    cluster_name   Name for the cluster (optional, use default cluster if not provided)
+EOF
+}
+
+usage_list () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} list
+  
+  List all clusters and get some informations on their status
+EOF
+}
+
+usage_default () {
+  cat <<EOF | sed -E "s/^  //"
+  Usage:  ${0##*/} default [<cluster_name>]
+  
+  Define the cluster to use by default when environment variable or command-line option
+  are not defined
+  
+  Arguments:
+    cluster_name   The cluster name, if none given remove configuration and fallback
+                   to the default value '${SD_DEFAULT_CLUSTER_NAME}')
+EOF
+}
+###< Documentation
+
+
+######################################################################################
+#
+# Function for parsing options and argument of all commands
+#
+######################################################################################
+
+command_init () {
+  # Parse options
+  local NODE_NAME  PRIVILEGED_MODE=1  IMAGE=${DIND_IMAGE}
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_init
+        exit 0;;
+      --node)
+        NODE_NAME=${2}
+        shift 2;;
+      -i | --image)
+        IMAGE=${2}
+        shift 2;;
+      --mount-certs)
+        EXTRA_RUN_OPTIONS+=" -v /etc/docker/certs.d:/etc/docker/certs.d"
+        shift;;
+      --unprivileged)
+        PRIVILEGED_MODE=0
+        shift;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} init --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -gt 1 ]; then
+    e_error "'${0##*/} init' accepts at most 1 argument"
+    e_error "Run '${0##*/} init --help' for more information"
+    exit 1
+  fi
+  CLUSTER_NAME=${1:-${CLUSTER_NAME}}
+  init_cluster ${CLUSTER_NAME} ${NODE_NAME:-$(gen_name)} ${IMAGE} ${PRIVILEGED_MODE}
+}
+###< command_init
+
+command_nodes () {
+  local WITH_IP=1 LONG_ID=
+  local FILTER=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_nodes
+        exit 0;;
+      -m | --managers)
+        [[ -n ${FILTER} ]] && { e_error "options '--managers' and '--workers' are exclusive"; exit 1; }
+        FILTER=manager
+        shift;;
+      -w | --workers)
+        [[ -n ${FILTER} ]] && { e_error "options '--managers' and '--workers' are exclusive"; exit 1; }
+        FILTER=worker
+        shift;;
+      --no-ip)
+        WITH_IP=
+        shift;;
+      --no-trunc)
+        LONG_ID=1
+        shift;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} nodes --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -ne 0 ]; then
+    e_error "'${0##*/} nodes' accepts no arguments"
+    e_error "Run '${0##*/} nodes --help' for more information"
+    exit 1
+  fi
+  cluster_nodes ${CLUSTER_NAME} "${WITH_IP}" "${LONG_ID}" ${FILTER}
+}
+###< command_nodes
+
+command_info () {
+  # Parse options
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_info
+        exit 0;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} info --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -ne 0 ]; then
+    e_error "'${0##*/} nodes' accepts no arguments"
+    e_error "Run '${0##*/} info --help' for more information"
+    exit 1
+  fi
+  cluster_info ${CLUSTER_NAME}
+}
+###< command_info
+
+command_apply () {
+  local NAMES PRIVILEGED_MODE=1 IMAGE=${DIND_IMAGE}
+  # Parse options
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_apply
+        exit 0;;
+      -i | --image)
+        IMAGE=${2}
+        shift 2;;
+      --mount-certs)
+        EXTRA_RUN_OPTIONS+=" -v /etc/docker/certs.d:/etc/docker/certs.d"
+        shift;;
+      --new-nodes )
+        NAMES=${2}
+        shift 2;;
+      --unprivileged)
+        PRIVILEGED_MODE=0
+        shift;;
+      -d | --dry-run)
+        SD_DRY_RUN=1
+        shift;;
+      -*)
+        [[ ${1} =~ -[1-9][0-9]* ]] && break # if negative number, assume we give first argument
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} apply --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -ne 2 ]; then
+    e_error "'${0##*/} apply' requires exactly 2 arguments"
+    e_error "Run '${0##*/} apply --help' for more information"
+    exit 1
+  fi
+  apply ${CLUSTER_NAME} "${1}" "${2}" "${IMAGE}" ${PRIVILEGED_MODE} "${NAMES}"
+}
+###< command_apply
+
+command_repair () {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_repair
+        exit 0;;
+      -d | --dry-run)
+        SD_DRY_RUN=1
+        shift;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} repair --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -ne 0 ]; then
+    e_error "'${0##*/} repair' accepts no arguments"
+    e_error "Run '${0##*/} repair --help' for more information"
+    exit 1
+  fi
+  repair_cluster ${CLUSTER_NAME}
+}
+###< command_repair
+
+command_destroy () {
+  # Parse options
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_destroy
+        exit 0;;
+      -d | --dry-run)
+        SD_DRY_RUN=1
+        shift;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} destroy --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -gt 1 ]; then
+    e_error "'${0##*/} destroy' accepts at most 1 argument"
+    e_error "Run '${0##*/} destroy --help' for more information"
+    exit 1
+  fi
+  CLUSTER_NAME=${1:-${CLUSTER_NAME}}
+  destroy_cluster ${CLUSTER_NAME}
+}
+###< command_destroy
+
+command_list () {
+  local WITH_IP=1 LONG_ID=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_list
+        exit 0;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} list --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -ne 0 ]; then
+    e_error "'${0##*/} list' accepts no arguments"
+    e_error "Run '${0##*/} list --help' for more information"
+    exit 1
+  fi
+  clusters_list ${CLUSTER_NAME}
+}
+###< command_list
+
+command_default () {
+  local WITH_IP=1 LONG_ID=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) # stop options
+        shift
+        break;;
+      -h | --help)
+        usage_default
+        exit 0;;
+      -*)
+        e_error "Unknown option -- '${1}'"
+        e_error "Run '${0##*/} default --help' for more information"
+        exit 1;;
+      *)
+        break;;
+    esac
+  done
+  if [ $# -gt 1 ]; then
+    e_error "'${0##*/} default' accepts at most 1 argument"
+    e_error "Run '${0##*/} default --help' for more information"
+    exit 1
+  fi
+  set_default_cluster ${1}
+}
+###< command_default
+
+###< Parse options/args of all commands
+
+
+######################################################################################
+#
+# Core function
+#
+######################################################################################
+
+#=====================================================================================
+# Search for manager node
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#=====================================================================================
+find_current_manager () {
+  check_cluster_name ${1}
+  local NODE_TO_TEST=$(readlink "${SD_CONFIG_DIR}/${1}/.manager")
+  local COMMAND_TO_TEST
+  [[ -n ${NODE_TO_TEST} ]] && try_and_set_node_as_available_manager ${1} ${NODE_TO_TEST} && return
+  # If current link not valid, search among dind-containers a manager
+  local NODES_TO_TEST=($(docker ps -qf label=swarm-dind.cluster=${1} --format {{.Names}}))
+  for NODE_TO_TEST in ${NODES_TO_TEST[@]/${NODE_TO_TEST}}; do
+    try_and_set_node_as_available_manager ${1} ${NODE_TO_TEST} && return
+  done
+  return 1
+}
+###< find_current_manager
+
+try_and_set_node_as_available_manager () {
+  local COMMAND_TO_TEST="docker exec ${2} docker"
+  local NODE_INFO=$(${COMMAND_TO_TEST} system info -f "{{.Swarm.ControlAvailable}}:{{.Swarm.NodeAddr}}" 2>/dev/null)
+  if [[ ${NODE_INFO} =~ ^true: ]]; then
+    SD_AVAILABLE_MANAGER_NODE=${2}
+    SD_AVAILABLE_MANAGER_IP=${NODE_INFO#*:}
+    SD_AVAILABLE_MANAGER_COMMAND=${COMMAND_TO_TEST}
+    mkdir -m 1777 -p "${SD_CONFIG_DIR}/${1}/${2}"
+    ln -nsf -- ${2} "${SD_CONFIG_DIR}/${1}/.manager"
+    return 0
+  fi
+  return 1
+}
+
+#=====================================================================================
+# Create a dind/node in which a Swarn cluster is bootstraped
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name    ${2}: node name
+#      ${3}: image           ${4}: privileged mode (0 or 1)
+#=====================================================================================
+init_cluster () {
+  e_section "Initializing cluster '${1}'"
+  check_cluster_name ${1}
+  if [[ -n $(docker ps -qf label=swarm-dind.cluster=${1}) ]]; then
+    e_error "${0##*/}: cluster ${1} is already declared"
+    exit 1
+  fi
+  e_step "Creating network for dind-nodes"
+  docker network create ${EXTRA_NETWORK_OPTIONS} -- ${1} &>/dev/null && e_info "Network ${1} created" || { e_error "Can't create network ${1}"; exit 1; }
+  e_step "Creating container for leader"
+  e_info "Preparing node ${2}"
+  prepare_node ${1} ${2} ${3} ${4}
+  wait_healthy ${2}
+  e_step "Init Swarm mode"
+  (exec &>/dev/null
+    if docker exec ${2} docker swarm init; then
+      is_docker_context_available && create_context ${1} ${2} || copy_certificates ${1} ${2}
+      mkdir -m 1777 -p "${SD_CONFIG_DIR}/${1}/${2}"
+      ln -nsf -- ${2} "${SD_CONFIG_DIR}/${1}/.manager"
+    fi
+  )
+  command_nodes
+}
+###< init_cluster
+
+#=====================================================================================
+# Detailled info about a cluster
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: show ip (any value or void)
+#      ${3}: display long id (any value or void)
+#      ${4}: filter (void | manager | worker)
+#=====================================================================================
+cluster_nodes () {
+  check_cluster_name ${1}
+  find_current_manager ${1} || {
+    e_error "No active manager found for cluster '${1}'"
+    exit 1
+  }
+  [[ -n ${4} ]] && local FILTER="-f role=${4}"
+  # NB: {{.EngineVersion}} not available on old version of docker node ls, so will fetch this info later with docker node inspect
+  local ENGINE_VERSION=$(${SD_AVAILABLE_MANAGER_COMMAND} node ls -f name=${SD_AVAILABLE_MANAGER_NODE} --format "{{.EngineVersion}}" &>/dev/null && echo "{{.EngineVersion}}" || echo "<engine_version>")
+  local STATUS=$(printf "%s\n" \
+     "ID:HOSTNAME:IP:STATUS:AVAILABILITY:MANAGER STATUS:ENGINE VERSION:CONTEXT:CERTIFICATES" \
+     $(${SD_AVAILABLE_MANAGER_COMMAND} node ls ${FILTER} --format "<id>{{.ID}}:{{.Hostname}}:<unknown>:{{.Status}}:{{.Availability}}:{{.ManagerStatus}}:${ENGINE_VERSION}:<ctx>:<cert>"))
+  local NODE_INFO NODES_INFO
+  if [[ ${ENGINE_VERSION} == "<engine_version>" ]]; then
+    NODES_INFO=($(${SD_AVAILABLE_MANAGER_COMMAND} node inspect -f "{{.Description.Hostname}}:{{.Description.Engine.EngineVersion}}" $(<<<"$STATUS" cut -d ":" -f 2 | tail -n +2)))
+    for NODE_INFO in "${NODES_INFO[@]}"; do
+      STATUS=$(<<<"${STATUS}" sed -E "/:${NODE_INFO%:*}:/ s/<engine_version>/${NODE_INFO#*:}/")
+    done
+  fi
+  local NODE_NAME CTX_EXISTS CERT_PATH_EXISTS
+  NODES_INFO=($(docker inspect -f '{{$network := index .NetworkSettings.Networks "'${1}'"}}{{.Name}}:{{$network.IPAddress}}:{{range $index, $value := .Config.Env}}{{if eq (index (split $value "=") 0) "DOCKER_TLS_CERTDIR" }}{{range $i, $part := (split $value "=")}}{{if gt $i 1}}{{print "="}}{{end}}{{if gt $i 0}}{{print $part}}{{end}}{{end}}{{end}}{{end}}' $(docker ps -qf label=swarm-dind.cluster=${1}) | cut -c 2- ))
+  is_docker_context_available || STATUS=$(<<<"${STATUS}" sed -E "1 s/:CONTEXT:/:/ ; 2,$ s/:<ctx>:/:/")
+  for NODE_NAME in $(<<<"$STATUS" cut -d ":" -f 2 | tail -n +2); do
+    NODE_INFO=$(printf '%s\n' "${NODES_INFO[@]}" | grep -o "^${NODE_NAME}:.*")
+    CTX_EXISTS=$(check_context ${1} ${NODE_NAME} && echo created)
+    if [[ -n $(<<<"${NODE_INFO}" cut -d ":" -f 3) ]]; then
+      CERT_PATH_EXISTS=$(check_certificates ${1} ${NODE_NAME} && echo installed)
+      STATUS=$(<<<"${STATUS}" sed -E "/:${NODE_NAME}:/ s/<cert>/${CERT_PATH_EXISTS}/")
+    else
+      STATUS=$(<<<"${STATUS}" sed -E "/:${NODE_NAME}:/ s|<cert>|n/a|")
+    fi
+    if [[ -n ${2} ]]; then
+      STATUS=$(<<<"${STATUS}" sed -E "/:${NODE_NAME}:/ s|<unknown>|$(<<<${NODE_INFO} cut -d ":" -f 2)|")
+    fi
+    is_docker_context_available && STATUS=$(<<<"${STATUS}" sed -E "/:${NODE_NAME}:/ s/<ctx>/${CTX_EXISTS}/")
+  done
+  if [[ -z ${2} ]]; then
+    STATUS=$(<<<"${STATUS}" sed -E "1 s/:IP:/:/ ; 2,$ s/:<unknown>:/:/")
+  fi
+  if [[ -n ${3} ]]; then
+    STATUS=$(<<<"${STATUS}" sed -E "s/<id>//")
+  else
+    STATUS=$(<<<"${STATUS}" sed -E "s/<id>([a-z0-9]{12})[a-z0-9]+/\1/i")
+  fi
+  STATUS=$(<<<"${STATUS}" sed -E "/:Leader:/ s/^[a-z0-9]+/\0 */i")
+  e_table "${STATUS[@]}"
+}
+###< cluster_nodes
+
+#=====================================================================================
+# Get env
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#=====================================================================================
+cluster_info () {
+  e_section "Useful info on cluster '${1}'"
+  e_step "Selecting a manager"
+  find_current_manager ${1} || {
+    e_error "No active manager found"
+    exit 1
+  }
+  local DOCKER_TLS_CERTDIR=$(docker inspect -f '{{range $index, $value := .Config.Env}}{{if eq (index (split $value "=") 0) "DOCKER_TLS_CERTDIR" }}{{range $i, $part := (split $value "=")}}{{if gt $i 1}}{{print "="}}{{end}}{{if gt $i 0}}{{print $part}}{{end}}{{end}}{{end}}{{end}}' ${SD_AVAILABLE_MANAGER_NODE})
+  e_info "Node ${SD_AVAILABLE_MANAGER_NODE} is available"
+  e_info
+  e_step "Send a Swarm command"
+  e_info "\033[1;90m# indirectly via dind-manager (always usable)\033[0m"
+  e_info "$ docker exec ${SD_AVAILABLE_MANAGER_NODE} docker [command]"
+  e_info
+  e_info "\033[1;90m# directly when 'docker context' command available\033[0m"
+  e_info "$ docker -c ${SD_AVAILABLE_MANAGER_NODE}.${1} [command]"
+  e_info
+  e_step "Tokens to add nodes to cluster"
+  e_info "export TOKEN_MANAGER=$(${SD_AVAILABLE_MANAGER_COMMAND} swarm join-token -q manager)"
+  e_info "export TOKEN_WORKER=$(${SD_AVAILABLE_MANAGER_COMMAND} swarm join-token -q worker)"
+  e_info
+  e_step "Environment variables"
+  e_info "\033[1;90m# standard method\033[0m"
+  if [[ -n ${DOCKER_TLS_CERTDIR} ]]; then
+    e_info "export DOCKER_HOST=tcp://${SD_AVAILABLE_MANAGER_IP}:2376"
+    e_info "export DOCKER_CERT_PATH=\"${SD_CONFIG_DIR}/${1}/${SD_AVAILABLE_MANAGER_NODE}\""
+    e_info "export DOCKER_TLS_VERIFY=1"
+  else
+    e_info "export DOCKER_HOST=tcp://${SD_AVAILABLE_MANAGER_IP}:2375"
+  fi
+  e_info
+  e_info "\033[1;90m# when 'docker context' command available\033[0m"
+  e_info "export DOCKER_CONTEXT=${SD_AVAILABLE_MANAGER_NODE}.${1}"
+}
+###< cluster_info
+
+#=====================================================================================
+# Apply change on a cluster
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: nb managers           ${3}: nb workers
+#      ${4}: image          ${5}: privileged (0 or 1)   ${6}: pool of new names
+#=====================================================================================
+apply () {
+  acquire_lock ${1}
+  e_section "Selecting a manager"
+  find_current_manager ${1} || {
+    e_error "No active manager found"
+    exit 1
+  }
+  e_info "Node ${SD_AVAILABLE_MANAGER_NODE} is available"
+  NB_MANAGERS=${2:-0}
+  NB_WORKERS=${3}
+  compute_plan "${CLUSTER_NAME}" "${NB_MANAGERS}" "${NB_WORKERS}" "${6}" MANAGERS_TO_ADD MANAGERS_TO_DEMOTE MANAGERS_TO_REMOVE WORKERS_TO_ADD WORKERS_TO_PROMOTE WORKERS_TO_REMOVE
+  [[ -n ${SD_DRY_RUN} ]] && exit 0
+  execute_plan "${CLUSTER_NAME}" "${MANAGERS_TO_ADD[*]}" "${MANAGERS_TO_DEMOTE[*]}" "${MANAGERS_TO_REMOVE[*]}" "${WORKERS_TO_ADD[*]}" "${WORKERS_TO_PROMOTE[*]}" "${WORKERS_TO_REMOVE[*]}" "${4}" ${5}
+  remove_erroneous "${SD_START_DATE}"
+}
+###< apply
+
+#=====================================================================================
+# Compute best action to accomplish to desired status
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: nb managers
+#      ${3}: nb workers     ${4}: pool of names
+# OUT  ${5}: managers to add      ${8}: workers to add
+#      ${6}: managers to demote   ${9}: workers to promote
+#      ${7}: managers to remove   ${10}: workers to remove
+#=====================================================================================
+compute_plan () {
+  e_section "Compute action to modify cluster '${1}'"
+  declare -n MGRS_ADD=${5} MGRS_DEMOTE=${6} MGRS_RM=${7} \
+             WKRS_ADD=${8} WKRS_PROMOTE=${9} WKRS_RM=${10}
+  # Cluster nodes status
+  local \
+    CURRENT_DIND_MGRS=($(${SD_AVAILABLE_MANAGER_COMMAND} node ls -f role=manager --format "{{.Hostname}}")) \
+    CURRENT_DIND_WKRS=($(${SD_AVAILABLE_MANAGER_COMMAND} node ls -f role=worker --format "{{.Hostname}}"))
+  local NB_ALL_MANAGERS=${#CURRENT_DIND_MGRS[@]} \
+    NB_ALL_WORKERS=${#CURRENT_DIND_WKRS[@]}
+  # Remove currently used manager of list so its not deleted during actions
+  CURRENT_DIND_MGRS=(${CURRENT_DIND_MGRS[@]/$SD_AVAILABLE_MANAGER_NODE})
+  local NB_TARGET_MANAGERS NB_TARGET_WORKERS
+  # Check manager parameter
+  if [[ ${2} =~ ^[1-9][0-9]*$ ]]; then
+    NB_TARGET_MANAGERS=${2}
+  elif [[ ${2} =~ ^[+-][1-9][0-9]*$ ]]; then
+    NB_TARGET_MANAGERS=$((${NB_ALL_MANAGERS} + ${2}))
+    if [ ${NB_TARGET_MANAGERS} -lt 1 ]; then
+      e_error "Error: You must have at least 1 manager"
+      exit 1
+    fi
+  elif [[ ${2} = "!" ]]; then
+    NB_TARGET_MANAGERS=${NB_ALL_MANAGERS}
+  else
+    e_error "Error: specify a valid value for managers"
+    e_error "Run '${0##*/} apply -h' for more information"
+    exit 1
+  fi
+  # Check worker parameter
+  if [[ ${3} =~ ^(0|[1-9][0-9]*)$ ]]; then
+    NB_TARGET_WORKERS=${3}
+  elif [[ ${3} =~ ^[+-][1-9][0-9]*$ ]]; then
+    NB_TARGET_WORKERS=$((${NB_ALL_WORKERS} + ${3}))
+    if [ ${NB_TARGET_WORKERS} -lt 0 ]; then
+      e_error "Error: You must have a positive (or null) number of workers"
+      exit 1
+    fi
+  elif [[ ${3} = "!" ]]; then
+    NB_TARGET_WORKERS=${NB_ALL_WORKERS}
+  else
+    e_error "Error: specify a valid number for workers"
+    e_error "Run '${0##*/} apply -h' for more information"
+    exit 1
+  fi
+  local \
+    DIFF_MANAGERS=$((${NB_TARGET_MANAGERS} - ${NB_ALL_MANAGERS})) \
+    DIFF_WORKERS=$((${NB_TARGET_WORKERS} - ${NB_ALL_WORKERS}))
+  # Try to optimize add/remove nodes by demoting/promoting
+  local NB_MGRS_DEMOTE=0    NB_MGRS_ADD=0   NB_MGRS_RM=0 \
+        NB_WKRS_PROMOTE=0   NB_WKRS_ADD=0   NB_WKRS_RM=0
+  if [ ${DIFF_MANAGERS} -ge 0 ] && [ ${DIFF_WORKERS} -le 0 ]; then
+    DIFF_WORKERS=$((-${DIFF_WORKERS}))
+    # Promote as many workers as possible, remove others, add missing new managers
+    NB_WKRS_PROMOTE=$(min ${DIFF_MANAGERS} ${DIFF_WORKERS})
+    NB_WKRS_RM=$((${DIFF_WORKERS} - ${NB_WKRS_PROMOTE}))
+    NB_MGRS_ADD=$(max $((${DIFF_MANAGERS} - ${NB_WKRS_PROMOTE})) 0)
+  elif [ ${DIFF_WORKERS} -ge 0 ] && [ ${DIFF_MANAGERS} -le 0 ]; then
+    DIFF_MANAGERS=$((-${DIFF_MANAGERS}))
+    # Demote as many managers as possible, remove others, add missing new workers
+    NB_MGRS_DEMOTE=$(min ${DIFF_MANAGERS} ${DIFF_WORKERS})
+    NB_MGRS_RM=$((${DIFF_MANAGERS} - ${NB_MGRS_DEMOTE}))
+    NB_WKRS_ADD=$(max $((${DIFF_WORKERS} - ${NB_MGRS_DEMOTE})) 0)
+  elif [ ${DIFF_WORKERS} -lt 0 ]; then
+    NB_MGRS_RM=$((-${DIFF_MANAGERS}))
+    NB_WKRS_RM=$((-${DIFF_WORKERS}))
+  else
+    NB_MGRS_ADD=${DIFF_MANAGERS}
+    NB_WKRS_ADD=${DIFF_WORKERS}
+  fi
+  local -a NAMES_POOL
+  # readarray -td, NAMES_POOL <<<"${4},"; unset 'NAMES_POOL[-1]' # bash >= 5.0 only
+  local OLDIFS=$IFS
+  IFS=','
+  NAMES_POOL=(${4})
+  IFS=$OLDIFS
+  e_step "Plan optimization"
+  e_table \
+    ":Current:Add:Remove:Change:After" \
+    "Managers:${NB_ALL_MANAGERS}:${NB_MGRS_ADD}:$((-${NB_MGRS_RM})):$((${NB_WKRS_PROMOTE} - ${NB_MGRS_DEMOTE})):${NB_TARGET_MANAGERS}" \
+    "Workers:${NB_ALL_WORKERS}:${NB_WKRS_ADD}:$((-${NB_WKRS_RM})):$((${NB_MGRS_DEMOTE} - ${NB_WKRS_PROMOTE})):${NB_TARGET_WORKERS}"
+  local IDX
+  MGRS_ADD=()
+  for IDX in $(seq 0 $((${NB_MGRS_ADD} - 1))); do
+    MGRS_ADD[${#MGRS_ADD[@]}]=${NAMES_POOL:-$(gen_name)}
+    NAMES_POOL=("${NAMES_POOL[@]:1}")
+  done
+  MGRS_DEMOTE=("${CURRENT_DIND_MGRS[@]:0:${NB_MGRS_DEMOTE}}")
+  MGRS_RM=("${CURRENT_DIND_MGRS[@]:${NB_MGRS_DEMOTE}:${NB_MGRS_RM}}")
+  WKRS_ADD=()
+  for IDX in $(seq 0 $((${NB_WKRS_ADD} - 1))); do
+    WKRS_ADD[${#WKRS_ADD[@]}]=${NAMES_POOL:-$(gen_name)}
+    NAMES_POOL=("${NAMES_POOL[@]:1}")
+  done
+  WKRS_PROMOTE=("${CURRENT_DIND_WKRS[@]:0:${NB_WKRS_PROMOTE}}")
+  WKRS_RM=("${CURRENT_DIND_WKRS[@]:${NB_WKRS_PROMOTE}:${NB_WKRS_RM}}")
+  e_step "Plan details"
+  local PLAN_TAB=()
+  if [[ -n ${MGRS_ADD}${MGRS_DEMOTE}${MGRS_RM} ]]; then
+    PLAN_TAB+=("Managers nodes")
+    [[ -n ${MGRS_ADD} ]]    && PLAN_TAB+=("   add:${MGRS_ADD[*]}")
+    [[ -n ${MGRS_DEMOTE} ]] && PLAN_TAB+=("   demote:${MGRS_DEMOTE[*]}")
+    [[ -n ${MGRS_RM} ]]     && PLAN_TAB+=("   remove:${MGRS_RM[*]}")
+  fi
+  if [[ -n ${WKRS_ADD}${WKRS_PROMOTE}${WKRS_RM} ]]; then
+    PLAN_TAB+=("Workers nodes")
+    [[ -n ${WKRS_ADD} ]]     && PLAN_TAB+=("   add:${WKRS_ADD[*]}")
+    [[ -n ${WKRS_PROMOTE} ]] && PLAN_TAB+=("   promote:${WKRS_PROMOTE[*]}")
+    [[ -n ${WKRS_RM} ]]      && PLAN_TAB+=("   remove:${WKRS_RM[*]}")
+  fi
+  e_table "${PLAN_TAB[@]}"
+  [[ -z ${PLAN_TAB} ]] && e_info "Nothing to do" && exit 0
+}
+###< compute_plan
+
+#=====================================================================================
+# Add / remove / demote /promote nodes in cluster
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#      ${2}: managers to add  ${3}: managers to demote  ${4}: managers to remove
+#      ${5}: workers to add   ${6}: workers to promote  ${7}: workers to remove
+#      ${8}: image            $[9]: privileged (0 or 1)
+#=====================================================================================
+execute_plan () {
+  e_section "Apply modifications to cluster '${1}'"
+  local NODE_NAME NODE_NAMES
+  
+  # Create dind-container for new nodes
+  NODE_NAMES=(${2} ${5})
+  [[ -n ${NODE_NAMES} ]] && e_step "Creating containers for nodes to add"
+  for NODE_NAME in "${NODE_NAMES[@]}"; do
+    e_info "Preparing node ${NODE_NAME}"
+    prepare_node ${1} ${NODE_NAME} ${8} ${9}
+  done
+  
+  # Switching roles
+  [[ -n ${3}${6} ]] && e_step "Changing nodes role"
+  NODE_NAMES=(${6})
+  [[ -n ${NODE_NAMES} ]] && ${SD_AVAILABLE_MANAGER_COMMAND} node promote "${NODE_NAMES[@]}"
+  NODE_NAMES=(${3})
+  [[ -n ${NODE_NAMES} ]] && ${SD_AVAILABLE_MANAGER_COMMAND} node demote "${NODE_NAMES[@]}"
+  
+  # Remove nodes
+  NODE_NAMES=(${4} ${7})
+  [[ -n ${NODE_NAMES} ]] && e_step "Removing nodes"
+  for NODE_NAME in "${NODE_NAMES[@]}"; do
+    e_info "Processing node ${NODE_NAME}"
+    remove_node ${1} ${NODE_NAME}
+  done
+  
+  # Add new nodes
+  NODE_NAMES=(${2} ${5})
+  [[ -n ${NODE_NAMES} ]] && wait_healthy "${NODE_NAMES[@]}"
+  [[ -n ${NODE_NAMES} ]] && e_step "Joining cluster"
+  for NODE_NAME in ${2}; do
+    e_info -n "Processing node ${NODE_NAME}... "
+    add_node ${1} ${NODE_NAME} manager && e_info "joined as manager" || e_info "failed to join"
+  done
+  for NODE_NAME in ${5}; do
+    e_info -n "Processing node ${NODE_NAME}... "
+    add_node ${1} ${NODE_NAME} worker && e_info "joined as worker" || e_info "failed to join"
+  done
+}
+###< execute_plan
+
+#=====================================================================================
+# Remove all datas for unready/uncomplete nodes
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name (used in label) to remove
+#=====================================================================================
+repair_cluster () {
+  acquire_lock ${1}
+  e_section "Repairing cluster '${1}'"
+  e_step "Selecting a manager"
+  find_current_manager ${1} || {
+    e_error "No active manager found"
+    exit 1
+  }
+  e_info "Node ${SD_AVAILABLE_MANAGER_NODE} is available"
+  local NODES_INFO=($(${SD_AVAILABLE_MANAGER_COMMAND} node ls --format "{{.Hostname}}:{{.ID}}:{{.ManagerStatus}}:{{.Status}}")) \
+        NODES_INFO_KO=($(printf '%s\n' ${NODES_INFO[@]} | grep -vE ":Ready$" || true))\
+        NODES_INFO_OK=($(printf '%s\n' ${NODES_INFO[@]} | grep -E ":Ready$" || true))
+  local NODES_CONFIG=($(find "${SD_CONFIG_DIR}/${1}/"* -maxdepth 0 -type d -printf "%f\n"))
+  local DINDS=($(docker ps -f "label=swarm-dind.cluster=${1}" --format "{{.Names}}"))
+  e_step "Checking nodes status"
+  local NODE_INFO NODE_NAME NODE_ID NODE_TYPE
+  local IS_CORRECTED=$([[ -n ${NODES_INFO_KO} ]] && echo 1)
+  for NODE_INFO in "${NODES_INFO_KO[@]}"; do
+    NODE_NAME=$(<<<"${NODE_INFO}" cut -d ":" -f 1)
+    NODE_ID=$(<<<"${NODE_INFO}" cut -d ":" -f 2)
+    NODE_TYPE=$([[ -n $(<<<"${NODE_INFO}" cut -d ":" -f 3) ]] && echo "manager" || echo "worker")
+    # NODE_TYPE=${NODE_TYPE:-worker}
+    e_info -n "Processing node ${NODE_NAME}: "
+    if [[ -n $(grep ${NODE_NAME} <<<"${NODES_INFO_OK[@]}") ]]; then
+      # The node has already rejoin the cluster, we can discard this instance
+      e_info -n "${NODE_ID} removing duplicate... "
+      if [[ -z ${SD_DRY_RUN} ]]; then
+        (exec &>/dev/null
+          ${SD_AVAILABLE_MANAGER_COMMAND} node demote ${NODE_ID}
+          ${SD_AVAILABLE_MANAGER_COMMAND} node rm -f ${NODE_ID}
+        ) && e_info "done" || e_info "error"
+      else
+        e_info "done"
+      fi
+    elif [[ -n $(<<<"${DINDS[@]}" grep ${NODE_NAME}) ]]; then
+      # The dind-container is still here, we try to rejoin
+      e_info -n "${NODE_ID} rejoining as ${NODE_TYPE}... "
+      if [[ -z ${SD_DRY_RUN} ]]; then
+        add_node ${1} ${NODE_NAME} ${NODE_TYPE} &>/dev/null && {
+          e_info "succeeded"
+          (exec &>/dev/null
+            [[ -z ${SD_DRY_RUN} && ${NODE_TYPE} = "manager" ]] && ${SD_AVAILABLE_MANAGER_COMMAND} node demote ${NODE_ID}
+            [[ -z ${SD_DRY_RUN} ]] && ${SD_AVAILABLE_MANAGER_COMMAND} node rm -f ${NODE_ID}
+          )
+          # Prevent node to try and rejoin again if others down instances are present
+          NODES_INFO_OK=("${NODES_INFO_OK[@]}" "${NODE_NAME}")
+          NODES_INFO_KO=("${NODES_INFO_KO[@]/${NODE_NAME}:*}")
+        } || e_info "failed"
+      else
+        e_info "succeeded"
+        NODES_INFO_OK=("${NODES_INFO_OK[@]}" "${NODE_INFO}")
+        NODES_INFO_KO=("${NODES_INFO_KO[@]/${NODE_NAME}:*}")
+      fi
+    else
+      # The dind-container was probably killed, we can discard this node
+      e_info "${NODE_ID} removing from cluster"
+      (exec &>/dev/null
+        [[ -z ${SD_DRY_RUN} && ${NODE_TYPE} = "manager" ]] && ${SD_AVAILABLE_MANAGER_COMMAND} node demote ${NODE_ID}
+        [[ -z ${SD_DRY_RUN} ]] && ${SD_AVAILABLE_MANAGER_COMMAND} node rm -f ${NODE_ID}
+        NODES_INFO_KO=("${NODES_INFO_KO[@]/${NODE_NAME}:*}")
+      )
+    fi
+  done
+  [[ -z ${IS_CORRECTED} ]] && e_info "OK"
+  e_step "Checking orphans containers without node"
+  printf "%s\n" "${NODES_INFO[@]%%:*}" | sort >${SD_TMP_DIR}/${1}/diff_nodes
+  printf "%s\n" "${DINDS[@]}" | sort >${SD_TMP_DIR}/${1}/diff_ctrs
+  ORPHANS=($(comm -23 ${SD_TMP_DIR}/${1}/diff_ctrs ${SD_TMP_DIR}/${1}/diff_nodes))
+  rm -f ${SD_TMP_DIR}/${1}/diff_*
+  for NODE_NAME in "${ORPHANS[@]}"; do
+    e_info "Removing ${NODE_NAME}"
+    [[ -z ${SD_DRY_RUN} ]] && remove_node ${1} ${NODE_NAME} &
+  done
+  [[ -z ${ORPHANS} ]] && e_info OK
+  e_step "Checking configs"
+  # Looking for missing certs and context
+  IS_CORRECTED=
+  for NODE_NAME in ${NODES_INFO[@]%%:*}; do
+    is_docker_context_available && {
+      docker context inspect ${NODE_NAME}.${1} &>/dev/null || {
+        e_info -n "${NODE_NAME}: creating context... "
+        ([[ -n ${SD_DRY_RUN} ]] || create_context ${1} ${NODE_NAME}) && e_info "succeeded" || e_info "failed"
+        IS_CORRECTED=1
+      }
+    }
+    check_certificates ${1} ${NODE_NAME} || {
+      e_info -n "${NODE_NAME}: installing certificates... "
+      ([[ -n ${SD_DRY_RUN} ]] || copy_certificates ${1} ${NODE_NAME}) && e_info "succeeded" || e_error "failed"
+      IS_CORRECTED=1
+    }
+  done
+  [[ -z ${IS_CORRECTED} ]] && e_info OK
+}
+###< repair_cluster
+
+#=====================================================================================
+# Remove all datas for unready/uncomplete nodes
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name (used in label) to remove
+#=====================================================================================
+clusters_list () {
+  local DINDS=($(docker ps --format '{{.Label "swarm-dind.cluster"}}' -f "label=swarm-dind.cluster"))
+  local CLUSTERS=($(printf '%s\n' "${DINDS[@]}" | sort | uniq)) 
+  local CLUSTER STATS NB_NODES NB_NODES_OK NB_WKRS NB_WKRS_OK NB_MGRS NB_MGRS_OK NB_STACKS NB_SERVICES LINE EXTRA
+  local TAB_STATS=("CLUSTER:MANAGERS:WORKERS:STACKS:SERVICES:CIDR:INFO")
+  local CIDR
+  for CLUSTER in ${CLUSTERS[@]}; do
+    e_info -n "\r\033[KFetching datas on ${CLUSTER}..."
+    EXTRA=()
+    CIDR=$(docker network inspect --format "{{range .IPAM.Config}} {{.Subnet}}{{end}}" -- ${CLUSTER})
+    CIDR=${CIDR:1}
+    find_current_manager ${CLUSTER} && {
+      STATS=$(${SD_AVAILABLE_MANAGER_COMMAND} node ls --format "${CLUSTER}:{{.Status}}:{{.ManagerStatus}}")
+      NB_NODES=$(wc -l <<<"${STATS}")
+      NB_NODES_OK=$(grep -ci ":Ready:" <<<"${STATS}")
+      NB_MGRS=$(grep -ciE ":(Leader|(Un)?Reachable)$" <<<"${STATS}")
+      NB_MGRS_OK=$(grep -iE ":(Leader|Reachable)$" <<<"${STATS}" | grep -ci ":Ready:")
+      NB_STACKS=$(${SD_AVAILABLE_MANAGER_COMMAND} stack ls --format "{{.Name}}" | wc -l)
+      NB_SERVICES=$(${SD_AVAILABLE_MANAGER_COMMAND} service ls --format "{{.ID}}" | wc -l)
+      LINE="${CLUSTER}:${NB_MGRS_OK} / ${NB_MGRS}:$((${NB_NODES_OK} - ${NB_MGRS_OK})) / $((${NB_NODES} - ${NB_MGRS})):${NB_STACKS}:${NB_SERVICES}:${CIDR}"
+    } || {
+      LINE="${CLUSTER}:?:?:?:?:${CIDR}"
+      EXTRA+=("No active manager found")
+    }
+    LINE=$(<<<"${LINE}" sed "s/${CLUSTER_NAME}:/${CLUSTER_NAME} *:/")
+    DIFF=$(($(grep -o -- ${CLUSTER} <<<"${DINDS[@]}" | wc -l) - ${NB_NODES:-0}))
+    if [ ${DIFF} -gt 0 ]; then
+      EXTRA+=("${DIFF} node(s) not in cluster")
+    fi
+    EXTRA=$(printf "%s ; " "${EXTRA[@]}")
+    TAB_STATS+=("${LINE}${EXTRA:+:${EXTRA:0: -3}}")
+  done
+  e_info -n "\r\033[K"
+  e_table "${TAB_STATS[@]}"
+}
+
+#=====================================================================================
+# Set the default cluster to use
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name or void to remove config.
+#=====================================================================================
+set_default_cluster () {
+  if [[ -z ${1} ]]; then
+    rm -f "${SD_CONFIG_DIR}/.default"
+    e_info "Back to default cluster '${SD_DEFAULT_CLUSTER_NAME}'"
+    exit
+  fi
+  if [[ -z $(docker ps -qf label=swarm-dind.cluster=${1}) ]]; then
+    e_error "Cluster '${1}' does not exist"
+    exit 1
+  fi
+  mkdir -m 1777 -p "${SD_CONFIG_DIR}/${1}"
+  if ln -nsf -- "${1}" "${SD_CONFIG_DIR}/.default"; then
+    e_info "Current cluster is now '${1}'"
+  else
+    e_error "Cluster not changed"
+    exit 1
+  fi
+}
+###< set_default_cluster
+
+#=====================================================================================
+# Completely remove a cluster (dind, configs, etc.)
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#=====================================================================================
+destroy_cluster () {
+  acquire_lock ${1}
+  e_section "Destroying cluster '${1}'"
+  check_cluster_name ${1}
+  e_step "Removing dind"
+  local NODE NODES=($(docker ps -f "label=swarm-dind.cluster=${1}" --format {{.Names}}))
+  for NODE in "${NODES[@]}"; do
+    e_info "Processing ${NODE}"
+    if [[ -z ${SD_DRY_RUN} ]]; then
+      (exec &>/dev/null
+        docker rm -f ${NODE}
+        is_docker_context_available && docker context rm -f ${NODE}.${1}
+      )
+    fi
+  done
+  e_info -n "Waiting all dind are removed"
+  until [[ -n ${SD_DRY_RUN} || -z $(docker ps -qf "label=swarm-dind.cluster=${1}") ]]; do
+    e_info -n "."
+    sleep 1
+  done;
+  echo
+  e_step "Cleaning config"
+  e_info "Removing network"
+  [[ -z ${SD_DRY_RUN} ]] && docker network rm -- ${1} &>/dev/null
+  e_info "Removing files"
+  [[ -z ${SD_DRY_RUN} ]] && rm -rf "${SD_CONFIG_DIR}/${1}" "${SD_TMP_DIR}/${1}"
+  [[ $(readlink "${SD_CONFIG_DIR}/.default") = ${1} ]] && rm -f "${SD_CONFIG_DIR}/.default"
+  is_docker_context_available && {
+    local ORPHANED_CONTEXT=$(docker context ls --format "{{.Name}}" | grep -E "\.${1}$") && docker context rm -f ${ORPHANED_CONTEXT[@]} &>/dev/null
+  }
+}
+###< destroy_cluster
+
+#=====================================================================================
+# Configure a dind-container, without adding node
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: node name
+#      ${3}: image          ${4}: privileged mode (0 or 1)
+#=====================================================================================
+prepare_node () {
+  local PRIVILEGED_MODE
+  [[ ${4} -eq 1 ]] && PRIVILEGED_MODE=--privileged
+  # Some options musn't be overridden, so they are after ${EXTRA_RUN_OPTIONS}
+  docker &>/dev/null run --rm -d \
+    ${PRIVILEGED_MODE} \
+    --hostname ${2} \
+    --health-cmd "docker version" --health-interval 5s --health-retries 2 \
+    ${EXTRA_RUN_OPTIONS} \
+    --name ${2} \
+    --network ${1} \
+    -l swarm-dind.api=v1 \
+    -l "swarm-dind.cluster=${1}" \
+    ${3} \
+      ${EXTRA_COMMAND_PARAMS}
+}
+###< prepare_node
+
+#=====================================================================================
+# Adding members
+#-------------------------------------------------------------------------------------
+# IN    ${1}: cluster name           ${2}: node name
+#       ${3}: type (manager|worker)
+#=====================================================================================
+add_node () {
+  local NODE_IP=$(docker inspect -f '{{$network := index .NetworkSettings.Networks "'${1}'"}}{{$network.IPAddress}}' ${2})
+  local JOIN_COMMAND=$(${SD_AVAILABLE_MANAGER_COMMAND} swarm join-token ${3} | grep "docker swarm join")
+  docker exec ${2} ${JOIN_COMMAND} &>/dev/null && {
+    mkdir -m 1777 -p "${SD_CONFIG_DIR}/${1}/${2}"
+    is_docker_context_available && create_context ${1} ${2}
+    true
+  }
+}
+###< add_node
+
+#=====================================================================================
+# Gracefully remove a node and its config
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: node name
+#=====================================================================================
+remove_node () {
+  (exec &>/dev/null
+    ${SD_AVAILABLE_MANAGER_COMMAND} node demote ${2}
+    docker exec ${2} docker swarm leave -f
+    ${SD_AVAILABLE_MANAGER_COMMAND} node rm -f ${2}
+    is_docker_context_available && docker context rm -f ${2}.${1}
+    find "${SD_CONFIG_DIR}" -type d -name ${2} -exec rm -rf {} \;
+    docker rm -f ${2}
+  )
+}
+###< remove_node
+
+#=====================================================================================
+# Wait for containers to be healthy
+#-------------------------------------------------------------------------------------
+# IN   ${@}: names of contaners to wait
+#=====================================================================================
+wait_healthy () {
+  e_step "Waiting containers are healthy"
+  local TIMEOUT=20
+  if [ $# -gt 10 ]; then
+    TIMEOUT=$((${TIMEOUT} + 3*($#-10)/5))
+  fi
+  local IDX
+  for IDX in $(seq 1 15); do
+    local HEALTHY=($(docker ps -qf name="$(IFS=\|; echo "${*}")" -f "health=healthy"))
+    e_info -n "\r\033[K${#HEALTHY[@]}/$#"
+    printf "%0.s." $(eval echo {1..${IDX}})
+    [ ${#HEALTHY[@]} -eq $# ] && sleep 2 && e_info "\nAll containers are ready" && return
+    sleep 1
+  done
+  e_error "\nSome containers are still not properly started, following steps may have errors"
+}
+###< wait_healthy
+
+#=====================================================================================
+# Remove all nodes with "Unknown" Status
+#-------------------------------------------------------------------------------------
+# IN   ${1}: minimum date of node creation (optional)
+#=====================================================================================
+remove_erroneous () {
+  e_section "Checking and removing nodes in unknown status"
+  local UNKNOWN_NODES_IDS=($(${SD_AVAILABLE_MANAGER_COMMAND} node ls --format "{{.ID}}:{{.Status}}" | grep -E ":Unknown$" | cut -d ":" -f 1))
+  [[ -z ${UNKNOWN_NODES_IDS} ]] && return
+  if [[ -n ${1} ]]; then
+    local IDX NODE_DATE
+    for IDX in "${!UNKNOWN_NODES_IDS[@]}"; do
+      NODE_DATE=$(${SD_AVAILABLE_MANAGER_COMMAND} node inspect --format "{{.CreatedAt}}" ${UNKNOWN_NODES_IDS[${IDX}]} | cut -d " " -f 1-2)
+      [[ ${NODE_DATE} < ${1} ]] && unset UNKNOWN_NODES_IDS[${IDX}]
+    done
+  fi
+  [ "${#UNKNOWN_NODES_IDS[@]}" -gt 0 ] && ${SD_AVAILABLE_MANAGER_COMMAND} node rm -f ${UNKNOWN_NODES_IDS[@]}
+  return $?
+}
+###< remove_erroneous
+
+#=====================================================================================
+# Verify cluster name rules
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#=====================================================================================
+check_cluster_name () {
+  if [[ ! ${1} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    e_error "${0##*/}: invalid cluster name (${1}), only ^[a-zA-Z0-9_-]+$ are allowed"
+    exit 1
+  fi
+}
+
+#=====================================================================================
+# Verify if context defined for a node
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: node name
+#=====================================================================================
+check_context () {
+  docker context inspect ${2}.${1} &>/dev/null
+}
+
+#=====================================================================================
+# Verify if node certificates are present
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: node name
+#=====================================================================================
+check_certificates () {
+  local DIND_CERT_PATH="$(docker inspect -f '{{range $index, $value := .Config.Env}}{{if eq (index (split $value "=") 0) "DOCKER_TLS_CERTDIR" }}{{range $i, $part := (split $value "=")}}{{if gt $i 1}}{{print "="}}{{end}}{{if gt $i 0}}{{print $part}}{{end}}{{end}}{{end}}{{end}}' ${2})"
+  [[ -z ${DIND_CERT_PATH} ]] && return 0
+  [ $(find "${SD_CONFIG_DIR}/${1}/${2}" -name ca.pem -o -name cert.pem -o -name key.pem 2>/dev/null | wc -l) -eq 3 ]
+}
+
+#=====================================================================================
+# Locally copy certs from dind-container
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name   ${2}: node name
+#=====================================================================================
+copy_certificates () {
+  local LOCAL_CERT_PATH="${SD_CONFIG_DIR}/${1}/${2}"
+  local DIND_CERT_PATH="$(docker inspect -f '{{range $index, $value := .Config.Env}}{{if eq (index (split $value "=") 0) "DOCKER_TLS_CERTDIR" }}{{range $i, $part := (split $value "=")}}{{if gt $i 1}}{{print "="}}{{end}}{{if gt $i 0}}{{print $part}}{{end}}{{end}}{{end}}{{end}}' ${2})"
+  [[ -n ${DIND_CERT_PATH} ]] && (exec 2>/dev/null
+    mkdir -m 1777 -p $(dirname "${LOCAL_CERT_PATH}") || return 1
+    rm -rf "${LOCAL_CERT_PATH}" # remove ${2} sub dir or files copied in ${2}/client!!!
+    docker cp ${2}:${DIND_CERT_PATH}/client "${LOCAL_CERT_PATH}" || return 1
+    find "${LOCAL_CERT_PATH}" -mindepth 1 -maxdepth 1 ! -name ca.pem ! -name key.pem ! -name cert.pem -exec rm -rf {} + 2>/dev/null
+  )
+}
+
+#=====================================================================================
+# Check if docker client suppports context
+#=====================================================================================
+is_docker_context_available () {
+  [[ -n ${SD_DOCKER_CONTEXT_AVAILABLE} ]] && true || false
+}
+
+#=====================================================================================
+# Create a context for this node, use DOCKER_TLS_CERTDIR to define if daemon use TLS
+#-------------------------------------------------------------------------------------
+# IN    ${1}: cluster name           ${2}: node name
+#=====================================================================================
+create_context () {
+  local NODE_INFO=$(docker inspect -f '{{$network := index .NetworkSettings.Networks "'${1}'"}}{{$network.IPAddress}}:{{range $index, $value := .Config.Env}}{{if eq (index (split $value "=") 0) "DOCKER_TLS_CERTDIR" }}{{range $i, $part := (split $value "=")}}{{if gt $i 1}}{{print "="}}{{end}}{{if gt $i 0}}{{print $part}}{{end}}{{end}}{{end}}{{end}}' ${2})
+  local CERT_PATH="${SD_CONFIG_DIR}/${1}/${2}"
+  (exec &>/dev/null
+    if [[ -n ${NODE_INFO#*:} ]]; then
+      copy_certificates ${1} ${2}
+      docker context create ${2}.${1} --docker host=tcp://${NODE_INFO%:*}:2376,ca=${CERT_PATH}/ca.pem,cert=${CERT_PATH}/cert.pem,key=${CERT_PATH}/key.pem --default-stack-orchestrator swarm
+    else
+      docker context create ${2}.${1} --docker host=tcp://${NODE_INFO%:*}:2375 --default-stack-orchestrator swarm
+    fi
+  )
+}
+###< create_context
+
+
+######################################################################################
+#
+# Helper functions
+#
+######################################################################################
+
+#=====================================================================================
+# Prevent parallel execution for revelant commands
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#=====================================================================================
+acquire_lock () {
+  local LOCK_FILE="${SD_TMP_DIR}/$1/lock"
+  mkdir -p "${SD_TMP_DIR}/$1"
+  if (set -o noclobber; echo "$$" >"${LOCK_FILE}") 2>/dev/null; then
+    trap 'release_lock "'${1}'"; exit $?' INT TERM EXIT
+  else
+    local LOCKING_PID=$(cat "${LOCK_FILE}")
+    if ! ps ${LOCKING_PID} &>/dev/null; then
+      release_lock "${1}"
+      if (set -o noclobber; echo "$$" >"${LOCK_FILE}") 2>/dev/null; then
+        trap 'release_lock "'${1}'"; exit $?' INT TERM EXIT
+        return
+      fi
+    fi
+    e_error "A process is already running for cluster '${1}'"
+    exit 1
+  fi
+}
+###< acquire_lock
+
+#=====================================================================================
+# Remove lock on a command
+#-------------------------------------------------------------------------------------
+# IN   ${1}: cluster name
+#=====================================================================================
+release_lock () {
+  local LOCK_FILE="${SD_TMP_DIR}/${1}/lock"
+  rm -rf "${SD_TMP_DIR}/${1}" 2>/dev/null
+}
+###< release_lock
+
+#=====================================================================================
+###> Format display functions
+#=====================================================================================
+e_section () {
+  echo -e "\033[0;33m### ${@}\033[0m"
+}
+
+e_step () {
+  echo -e "\033[0;34m# ${@}\033[0m"
+}
+
+e_info () {
+  echo -e "${@}"
+}
+
+e_error () {
+  echo >&2 -e "${@}"
+}
+
+e_table () { # Each element of array is a line with values separated by ':'
+  printf '%s\n' "${@}" | column ${SD_COLUMN_OPTIONS} -s ":"
+}
+###< Format display functions
+
+#=====================================================================================
+# Generate a randomized name
+#-------------------------------------------------------------------------------------
+# IN   ${1}: suffix
+#=====================================================================================
+gen_name () {
+  </dev/urandom tr -cd 'a-z0-9' | head -c 8
+  echo ${1:+.${1}}
+}
+###< gen_name
+
+#=====================================================================================
+# Return maximum value from an integer list
+#-------------------------------------------------------------------------------------
+# IN   ${@}: array of integers
+#=====================================================================================
+max () {
+  printf '%s\n' ${@} | sort -nr | head -1
+}
+
+#=====================================================================================
+# Return minimum value from an integer list
+#-------------------------------------------------------------------------------------
+# IN   ${@}: array of integers
+#=====================================================================================
+min () {
+  printf '%s\n' ${@} | sort -n | head -1
+}
+
+
+######################################################################################
+#
+# SCRIPT STARTS HERE
+# Prepare environment values and parse commande line
+#
+######################################################################################
+
+#=====================================================================================
+# Assign default values and ensure some important vars are not injected
+#=====================================================================================
+# Constants or vars setted only by script
+SD_START_DATE="$(date -u +'%Y-%m-%d %H:%M:%S.%N')"
+SD_COMMAND=
+SD_DRY_RUN=
+SD_AVAILABLE_MANAGER_NODE=
+SD_AVAILABLE_MANAGER_IP=
+SD_AVAILABLE_MANAGER_COMMAND=
+SD_CONFIG_DIR="${DOCKER_CONFIG:-${HOME}/.docker}/swarm-dind"
+SD_DEFAULT_CLUSTER_NAME="swarm_cluster"
+SD_TMP_DIR="/tmp/swarm-dind"
+SD_DOCKER_CONTEXT_AVAILABLE=$(docker context 2>/dev/null && echo 1)
+SD_COLUMN_OPTIONS=$(column -n <<<"" 2>/dev/null && echo "-n -t" || echo "-t")
+# Variables that can be overriden by user
+[[ -z ${CLUSTER_NAME} ]] && CLUSTER_NAME=$(readlink "${SD_CONFIG_DIR}/.default")
+: ${CLUSTER_NAME:=${SD_DEFAULT_CLUSTER_NAME}}
+: ${DIND_IMAGE:=docker:stable-dind}
+
+#=====================================================================================
+# Parse options from command line
+#=====================================================================================
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) # stop options
+      shift
+      break;;
+    -h | --help)
+      usage
+      exit 0;;
+    -v | --version)
+      version
+      exit 0;;
+    -c | --cluster)
+      CLUSTER_NAME=${2}
+      shift 2;;
+    -*)
+      e_error "Unknown option -- '${1}'"
+      e_error "Run '${0##*/} --help' for more information"
+      exit 1;;
+    *)
+      SD_COMMAND=${1}
+      shift
+      break;;
+  esac
+done
+
+# Verify if a default cluster na
+# Check if command is valid, parse options and execute
+if declare -xF command_${SD_COMMAND}; then
+  command_${SD_COMMAND} "${@}"
+else
+  [[ -n ${SD_COMMAND} ]] && e_error "${0##*/} : invalid command -- '${SD_COMMAND}'" || e_error "${0##*/} : missing command"
+  e_error "Run '${0##*/} --help' for more information"
+  exit 1
+fi
