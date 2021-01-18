@@ -1,6 +1,6 @@
 # Swarm-DinD
 
-[![Release](https://img.shields.io/badge/release-v1.0.0-orange)](https://gitlab.com/jmeb-prj/swarm-dind-manager/-/releases/v1.0.1)
+[![Release](https://img.shields.io/badge/release-v1.0.0-orange)](https://gitlab.com/jmeb-prj/swarm-dind-manager/-/releases/v1.1.0)
 [![Software License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://gitlab.com/jmeb-prj/swarm-dind-manager/-/blob/master/COPYING)
 
 ## Goals
